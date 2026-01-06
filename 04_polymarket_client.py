@@ -277,14 +277,6 @@ class PolymarketClient:
         if print_markets and not results:
             print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.")
             print("💡 Try increasing window_minutes, or loosen the 15m filter if the series is labeled differently.\n")
-            if relaxed_results:
-                print("⚠️  No strict Up/Down markets found; using relaxed 15m BTC/ETH set.\n")
-                results = relaxed_results
-                for m in results:
-                    if print_markets:
-                        self.print_market(m, now)
-            else:
-                print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.\n")
 
         return results
 

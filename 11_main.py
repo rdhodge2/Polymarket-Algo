@@ -48,147 +48,18 @@ except ImportError as e:
 
 
 # Configuration
-# =============================
-STARTING_BANKROLL = 250
-SCAN_INTERVAL_SECONDS = 30
-EXIT_CHECK_INTERVAL_SECONDS = 10
-DRY_RUN = True
-
-# Market timing
-MIN_TIME_BEFORE_EXPIRY = 1.5     # stop trading 90s before expiry
-MAX_TIME_BEFORE_EXPIRY = 40
-MARKET_LOOKUP_WINDOW = 45
-
-CURRENT_MARKET_MAX = 14
-NEXT_MARKET_MAX = 28
-# 28-40 = FUTURE
-
-# Adaptive spread thresholds (ABS cents)
-SPREAD_THRESHOLD_CURRENT = 0.12
-SPREAD_THRESHOLD_NEXT = 0.20
-SPREAD_THRESHOLD_FUTURE = 0.30
+STARTING_BANKROLL = 250         # Starting with $1000
+SCAN_INTERVAL_SECONDS = 30       # Check for new signals every 30s
+EXIT_CHECK_INTERVAL_SECONDS = 10 # Check exits every 10s
+DRY_RUN = True                   # Set False to trade real money
+MARKET_WINDOW_MINUTES = 30       # Look for markets ending in next 30 min
 
 
-# =============================
-# Small helpers
-# =============================
-def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if v is None:
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def _fmt_price(v: Any, places: int = 4, default: str = "None") -> str:
-    x = _safe_float(v, None)
-    if x is None:
-        return default
-    return f"{x:.{places}f}"
-
-
-def _extract_slug_unix_end_dt(slug: str) -> Optional[datetime]:
-    """
-    Format expected: btc-updown-15m-1767645900
-    """
-    try:
-        ts = int(slug.split("-")[-1])
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    except Exception:
-        return None
-
-
-def _resolve_signal_action(signal: Dict[str, Any]) -> str:
-    """
-    Supports:
-      - old schema: signal['side']
-      - new schema: signal['action']
-    Defaults to BUY.
-    """
-    side = signal.get("side")
-    action = signal.get("action")
-
-    s = (side or action or "BUY")
-    s = str(s).upper().strip()
-    if s not in ("BUY", "SELL"):
-        s = "BUY"
-    return s
-
-
-def _resolve_signal_confidence(signal: Dict[str, Any]) -> int:
-    c = signal.get("confidence")
-    try:
-        if c is None:
-            return 0
-        return int(c)
-    except Exception:
-        return 0
-
-
-def _resolve_expected_edge(signal: Dict[str, Any]) -> float:
-    return float(signal.get("expected_edge", 0.0) or 0.0)
-
-
-def _signal_recommended_outcome(signal: Dict[str, Any]) -> Optional[str]:
-    """
-    If your detector returns recommended_outcome, prefer it.
-    Otherwise infer from fade_direction if present.
-    Returns a label like "Up"/"Down"/"YES"/"NO" (case-insensitive).
-    """
-    ro = signal.get("recommended_outcome")
-    if ro:
-        return str(ro)
-
-    fade = (signal.get("fade_direction") or "").upper().strip()
-    # If token price moved UP and we fade it, we want the OPPOSITE outcome -> "Down"/"NO"
-    if fade == "FADE_UP":
-        return "Down"
-    if fade == "FADE_DOWN":
-        return "Up"
-    return None
-
-
-def _pick_token_id_for_outcome(
-    market: Dict[str, Any],
-    poly: Any,
-    desired_label: Optional[str],
-    fallback_token_id: str,
-    fallback_label: Optional[str],
-) -> str:
-    """
-    Given a market and a desired outcome label (Up/Down or YES/NO),
-    return the token_id that corresponds to that label.
-    Falls back to the currently selected token_id if no match.
-    """
-    if not desired_label:
-        return fallback_token_id
-
-    desired = desired_label.strip().lower()
-    token_ids = poly.get_token_ids_from_market(market) or []
-    outcomes = poly.get_outcomes_from_market(market) or []
-
-    # Build label->token map
-    for i, tid in enumerate(token_ids):
-        label = outcomes[i] if i < len(outcomes) else ""
-        if str(label).strip().lower() == desired:
-            return tid
-
-    # Heuristic for Up/Down when labels might differ (e.g. "Yes"/"No")
-    # If desired is "down"/"no", and fallback_label is "up"/"yes", then pick the other token.
-    if len(token_ids) >= 2 and fallback_label:
-        fb = str(fallback_label).strip().lower()
-        if (desired in ("down", "no") and fb in ("up", "yes")) or (desired in ("up", "yes") and fb in ("down", "no")):
-            # pick other
-            return token_ids[1] if token_ids[0] == fallback_token_id else token_ids[0]
-
-    return fallback_token_id
-
-
-# =============================
-# Main Bot
-# =============================
 class PolymarketTradingBot:
+    """
+    The complete automated trading system
+    """
+    
     def __init__(self, starting_bankroll: float, dry_run: bool = True):
         self.dry_run = dry_run
         
@@ -317,76 +188,26 @@ class PolymarketTradingBot:
             
             if not token_ids:
                 continue
-
-            print(f"      ✅ Regime passed (score: {regime.get('regime_score', 0.0):.1%})")
-
-            token_id_selected = selected_token.get("token_id")
-            outcome_selected = selected_token.get("label")
-
-            if not token_id_selected:
-                continue
-
-            # Detect signal on selected token
-            signal = self._check_token_for_signal(
-                market=market,
-                token_id=token_id_selected,
-                outcome=str(outcome_selected) if outcome_selected else "Selected",
-                btc_prices=btc_prices,
-                btc_change_5min=btc_change_5min,
-                regime_passed=True
-            )
-
-            if not signal:
-                print("      ⏭️  No overreaction signal")
-                continue
-
-            # If detector suggests different outcome, map to correct token id
-            desired_outcome = _signal_recommended_outcome(signal)
-            token_id_trade = _pick_token_id_for_outcome(
-                market=market,
-                poly=self.poly,
-                desired_label=desired_outcome,
-                fallback_token_id=token_id_selected,
-                fallback_label=outcome_selected
-            )
-            signal["token_id"] = token_id_trade  # enforce the token we intend to trade
-            signal["outcome"] = desired_outcome or outcome_selected or signal.get("outcome") or "Selected"
-
-            signals_found += 1
-            print("      🎯 SIGNAL DETECTED!")
-            self._execute_signal(signal)
-
-        print()
+            
+            # Check each token (YES and NO)
+            for i, token_id in enumerate(token_ids):
+                outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
+                
+                signal = self._check_token_for_signal(
+                    market=market,
+                    token_id=token_id,
+                    outcome=outcome,
+                    btc_prices=btc_prices,
+                    btc_change_5min=btc_change_5min
+                )
+                
+                if signal:
+                    signals_found += 1
+                    self._execute_signal(signal)
+        
         if signals_found == 0:
-            print("   No actionable signals detected this scan")
-        else:
-            print(f"   🎉 Found {signals_found} signal(s)")
-
-    def _check_market_old_method(
-        self,
-        market: Dict[str, Any],
-        btc_prices: List[float],
-        btc_change_5min: float
-    ) -> Optional[Dict[str, Any]]:
-        token_ids = self.poly.get_token_ids_from_market(market)
-        outcomes = self.poly.get_outcomes_from_market(market)
-        if not token_ids:
-            return None
-
-        for i, token_id in enumerate(token_ids):
-            outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-            signal = self._check_token_for_signal(
-                market=market,
-                token_id=token_id,
-                outcome=outcome,
-                btc_prices=btc_prices,
-                btc_change_5min=btc_change_5min,
-                regime_passed=False
-            )
-            if signal:
-                return signal
-        return None
-
+            print("   No signals detected this scan")
+    
     def _check_token_for_signal(
         self,
         market: Dict[str, Any],
@@ -436,7 +257,7 @@ class PolymarketTradingBot:
             recent_prices=recent_prices,
             recent_trades=recent_trades,
             orderbook=orderbook,
-            btc_price_change_5min=float(btc_change_5min),
+            btc_price_change_5min=btc_change_5min
         )
         
         if not signal:
@@ -523,50 +344,56 @@ class PolymarketTradingBot:
         if self.dry_run:
             print(f"   🧪 DRY RUN: Would place order")
             trade_executed = True
-            entry_price = float(signal.get("current_price", 0.0) or 0.0)
+            entry_price = signal['current_price']
         else:
             # Place real order
             order = self.poly.place_order_stub(
                 token_id=token_id,
-                side=side,
-                price=float(signal.get("current_price", 0.0) or 0.0),
-                size=final_size,
+                side=signal['side'],
+                price=signal['current_price'],
+                size=sizing['final_size']
             )
-            trade_executed = bool(order)
-            entry_price = float(signal.get("current_price", 0.0) or 0.0)
-            print("   ✅ Order placed" if trade_executed else "   ❌ Order failed")
-
-        if not trade_executed:
-            return
-
-        position = {
-            "token_id": token_id,
-            "market_slug": market.get("slug"),
-            "market_question": market.get("question"),
-            "outcome": signal.get("outcome"),
-            "side": side,
-            "entry_price": entry_price,
-            "entry_time": datetime.now(timezone.utc),
-            "size": final_size,
-            "signal": signal,
-        }
-        self.open_positions.append(position)
-        self.risk_mgr.open_position(position)
-
-        self.logger.log_signal({
-            "market_slug": market.get("slug"),
-            "market_question": market.get("question"),
-            "token_id": token_id,
-            "outcome": signal.get("outcome"),
-            "signal_type": "OVERREACTION",
-            "side": side,
-            "confidence": confidence,
-            "regime_ok": True,
-            "regime_score": float(signal.get("regime", {}).get("regime_score", 1.0) or 1.0),
-            "overreaction_score": signal.get("score"),
-            "traded": True,
-        })
-
+            
+            if order:
+                trade_executed = True
+                entry_price = signal['current_price']
+                print(f"   ✅ Order placed")
+            else:
+                trade_executed = False
+                print(f"   ❌ Order failed")
+        
+        if trade_executed:
+            # Record position
+            position = {
+                'token_id': token_id,
+                'market_slug': market.get('slug'),
+                'market_question': market.get('question'),
+                'outcome': signal['outcome'],
+                'side': signal['side'],
+                'entry_price': entry_price,
+                'entry_time': datetime.now(timezone.utc),
+                'size': sizing['final_size'],
+                'signal': signal
+            }
+            
+            self.open_positions.append(position)
+            self.risk_mgr.open_position(position)
+            
+            # Log signal
+            self.logger.log_signal({
+                'market_slug': market.get('slug'),
+                'market_question': market.get('question'),
+                'token_id': token_id,
+                'outcome': signal['outcome'],
+                'signal_type': 'OVERREACTION',
+                'side': signal['side'],
+                'confidence': signal['confidence'],
+                'regime_ok': True,
+                'regime_score': signal['regime']['regime_score'],
+                'overreaction_score': signal['score'],
+                'traded': True
+            })
+    
     def _check_exits(self):
         """
         Check all open positions for exit conditions
@@ -588,10 +415,13 @@ class PolymarketTradingBot:
         
         # Check each position
         positions_to_close = []
-
-        for position in list(self.open_positions):
-            token_id = position["token_id"]
+        
+        for position in self.open_positions:
+            token_id = position['token_id']
+            
+            # Get current price
             current_price = self.poly.get_current_price(token_id)
+            
             if current_price is None:
                 print(f"   ⚠️  Could not get price for {token_id[:20]}...")
                 continue
@@ -668,13 +498,11 @@ class PolymarketTradingBot:
         if self.open_positions:
             print(f"\n   Open Positions:")
             for pos in self.open_positions:
-                cp = self.poly.get_current_price(pos["token_id"])
-                if cp is None:
-                    continue
-                ep = float(pos.get("entry_price", 0.0) or 0.0)
-                pnl_pct = (float(cp) - ep) / ep if ep > 0 else 0.0
-                print(f"      • {pos.get('outcome')}: ${ep:.4f} → ${float(cp):.4f} ({pnl_pct:+.2%})")
-
+                current_price = self.poly.get_current_price(pos['token_id'])
+                if current_price:
+                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] if pos['entry_price'] > 0 else 0
+                    print(f"      • {pos['outcome']}: ${pos['entry_price']:.4f} → ${current_price:.4f} ({pnl_pct:+.2%})")
+    
     def _shutdown(self):
         """
         Graceful shutdown
