@@ -142,7 +142,7 @@ def _resolve_expected_edge(signal: Dict[str, Any]) -> float:
     return float(signal.get("expected_edge", 0.0) or 0.0)
 
 
-def _signal_recommended_outcome(signal: Dict[str, Any]) -> Optional[str]:
+def _signal_recommended_outcome(signal: Dict[str, Any], outcome_label: Optional[str] = None) -> Optional[str]:
     """
     If your detector returns recommended_outcome, prefer it.
     Otherwise infer from fade_direction if present.
@@ -152,6 +152,20 @@ def _signal_recommended_outcome(signal: Dict[str, Any]) -> Optional[str]:
     if ro:
         return str(ro)
 
+    if outcome_label:
+        lab = str(outcome_label).strip().lower()
+        fade = (signal.get("fade_direction") or "").upper().strip()
+        if fade == "FADE_UP":
+            if lab in ("up", "yes"):
+                return "Down" if lab == "up" else "No"
+            if lab in ("down", "no"):
+                return "Up" if lab == "down" else "Yes"
+        if fade == "FADE_DOWN":
+            if lab in ("up", "yes"):
+                return "Down" if lab == "up" else "No"
+            if lab in ("down", "no"):
+                return "Up" if lab == "down" else "Yes"
+
     fade = (signal.get("fade_direction") or "").upper().strip()
     # If token price moved UP and we fade it, we want the OPPOSITE outcome -> "Down"/"NO"
     if fade == "FADE_UP":
@@ -159,6 +173,22 @@ def _signal_recommended_outcome(signal: Dict[str, Any]) -> Optional[str]:
     if fade == "FADE_DOWN":
         return "Up"
     return None
+
+
+def _entry_price_from_book(orderbook: Dict[str, Any], side: str) -> Optional[float]:
+    if not orderbook:
+        return None
+    if side == "BUY":
+        return _safe_float(orderbook.get("best_ask")) or _safe_float(orderbook.get("mid")) or _safe_float(orderbook.get("best_bid"))
+    return _safe_float(orderbook.get("best_bid")) or _safe_float(orderbook.get("mid")) or _safe_float(orderbook.get("best_ask"))
+
+
+def _exit_price_from_book(orderbook: Dict[str, Any], side: str) -> Optional[float]:
+    if not orderbook:
+        return None
+    if side == "BUY":
+        return _safe_float(orderbook.get("best_bid")) or _safe_float(orderbook.get("mid")) or _safe_float(orderbook.get("best_ask"))
+    return _safe_float(orderbook.get("best_ask")) or _safe_float(orderbook.get("mid")) or _safe_float(orderbook.get("best_bid"))
 
 
 def _pick_token_id_for_outcome(
@@ -407,34 +437,50 @@ class PolymarketTradingBot:
             token_id_selected = selected_token.get("token_id")
             outcome_selected = selected_token.get("label")
 
-            if not token_id_selected:
+            token_ids = self.poly.get_token_ids_from_market(market) or []
+            outcomes = self.poly.get_outcomes_from_market(market) or []
+
+            candidates: List[Dict[str, Any]] = []
+            if token_id_selected:
+                candidates.append({"token_id": token_id_selected, "outcome": outcome_selected})
+
+            for i, token_id in enumerate(token_ids):
+                if token_id == token_id_selected:
+                    continue
+                outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
+                candidates.append({"token_id": token_id, "outcome": outcome})
+
+            if not candidates:
                 continue
 
-            # Detect signal on selected token
-            signal = self._check_token_for_signal(
-                market=market,
-                token_id=token_id_selected,
-                outcome=str(outcome_selected) if outcome_selected else "Selected",
-                btc_prices=btc_prices,
-                btc_change_5min=btc_change_5min,
-                regime_passed=True
-            )
+            signal = None
+            for candidate in candidates:
+                signal = self._check_token_for_signal(
+                    market=market,
+                    token_id=candidate["token_id"],
+                    outcome=str(candidate.get("outcome") or "Selected"),
+                    btc_prices=btc_prices,
+                    btc_change_5min=btc_change_5min,
+                    regime_passed=True
+                )
+                if signal:
+                    break
 
             if not signal:
                 print("      ⏭️  No overreaction signal")
                 continue
 
             # If detector suggests different outcome, map to correct token id
-            desired_outcome = _signal_recommended_outcome(signal)
+            desired_outcome = _signal_recommended_outcome(signal, signal.get("outcome"))
             token_id_trade = _pick_token_id_for_outcome(
                 market=market,
                 poly=self.poly,
                 desired_label=desired_outcome,
-                fallback_token_id=token_id_selected,
-                fallback_label=outcome_selected
+                fallback_token_id=signal.get("token_id") or token_id_selected,
+                fallback_label=signal.get("outcome") or outcome_selected
             )
             signal["token_id"] = token_id_trade  # enforce the token we intend to trade
-            signal["outcome"] = desired_outcome or outcome_selected or signal.get("outcome") or "Selected"
+            signal["outcome"] = desired_outcome or signal.get("outcome") or outcome_selected or "Selected"
 
             signals_found += 1
             print("      🎯 SIGNAL DETECTED!")
@@ -516,6 +562,7 @@ class PolymarketTradingBot:
             recent_trades=recent_trades or [],
             orderbook=orderbook,
             btc_price_change_5min=float(btc_change_5min),
+            outcome_label=str(outcome) if outcome is not None else None,
         )
         if not sig:
             return None
@@ -609,17 +656,17 @@ class PolymarketTradingBot:
         if self.dry_run:
             print("   🧪 DRY RUN: Would place order (BUY token)")
             trade_executed = True
-            entry_price = float(signal.get("current_price", 0.0) or 0.0)
+            entry_price = _entry_price_from_book(orderbook, side) or float(signal.get("current_price", 0.0) or 0.0)
         else:
             # Real order placement needs L2 auth; keep stub
             order = self.poly.place_order_stub(
                 token_id=token_id,
                 side=side,
-                price=float(signal.get("current_price", 0.0) or 0.0),
+                price=_entry_price_from_book(orderbook, side) or float(signal.get("current_price", 0.0) or 0.0),
                 size=final_size,
             )
             trade_executed = bool(order)
-            entry_price = float(signal.get("current_price", 0.0) or 0.0)
+            entry_price = _entry_price_from_book(orderbook, side) or float(signal.get("current_price", 0.0) or 0.0)
             print("   ✅ Order placed" if trade_executed else "   ❌ Order failed")
 
         if not trade_executed:
@@ -672,7 +719,10 @@ class PolymarketTradingBot:
 
         for position in list(self.open_positions):
             token_id = position["token_id"]
-            current_price = self.poly.get_current_price(token_id)
+            orderbook = self.poly.get_orderbook(token_id)
+            current_price = _exit_price_from_book(orderbook, position.get("side", "BUY")) if orderbook else None
+            if current_price is None:
+                current_price = self.poly.get_current_price(token_id)
             if current_price is None:
                 print(f"   ⚠️  Could not get price for {str(token_id)[:20]}...")
                 continue
@@ -731,7 +781,10 @@ class PolymarketTradingBot:
         if self.open_positions:
             print("\n   Open Positions:")
             for pos in self.open_positions:
-                cp = self.poly.get_current_price(pos["token_id"])
+                orderbook = self.poly.get_orderbook(pos["token_id"])
+                cp = _exit_price_from_book(orderbook, pos.get("side", "BUY")) if orderbook else None
+                if cp is None:
+                    cp = self.poly.get_current_price(pos["token_id"])
                 if cp is None:
                     continue
                 ep = float(pos.get("entry_price", 0.0) or 0.0)
