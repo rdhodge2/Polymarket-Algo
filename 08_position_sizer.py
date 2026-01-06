@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 MAX_POSITION_PCT = 0.02          # 2% of bankroll max
 KELLY_FRACTION = 0.25            # Use 1/4 Kelly (conservative)
 MAX_MARKET_DEPTH_PCT = 0.05      # Max 5% of market depth
-MIN_TRADE_SIZE = 10              # Minimum $10 per trade
+MIN_TRADE_SIZE = 3              # Minimum $10 per trade
 MAX_TRADE_SIZE = 200             # Maximum $200 per trade (initially)
 
 
