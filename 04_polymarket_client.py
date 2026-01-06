@@ -1,43 +1,45 @@
 """
-04 - Polymarket Client (Gamma + CLOB + Data API)
+04 - Polymarket Client (Gamma + CLOB + Data API)  ✅ DROP-IN REPLACEMENT
 
-What this script does (reliably, without pulling thousands of markets):
-- Uses Gamma API to find ACTIVE BTC/ETH 15-minute "Up or Down" markets by filtering on an end-date window
-- Uses CLOB public endpoint to pull the orderbook (/book) for a given token_id
-- Uses Data API (public) to pull recent trades (/trades) WITHOUT L2 auth
-  (Your 401 was because CLOB /data/trades is an authenticated "my trades" endpoint)
+Fixes common "static book" / wrong best-bid-ask issues:
+- Defensive sorting of bids/asks (API may not return sorted arrays)
+- Cache-busting + no-cache headers for /book
+- Captures response headers for debugging (Age/ETag/Cache)
+- Helpers to debug top-of-book and verify YES/NO (UP/DOWN) complementarity
 
-Docs (for reference):
-- Gamma markets: https://docs.polymarket.com/developers/gamma-markets-api/fetch-markets-guide
-- Gamma get markets: https://docs.polymarket.com/developers/gamma-markets-api/get-markets
-- Quickstart fetching data: https://docs.polymarket.com/quickstart/fetching-data
-- CLOB trades (auth): https://docs.polymarket.com/developers/CLOB/trades/trades
-- Data API trades (public): https://docs.polymarket.com/developers/CLOB/trades/trades-data-api
-- Data API trades (api reference): https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets
-
-NOTE about placing orders:
-- Placing/canceling orders uses CLOB L1/L2 auth (not a simple Bearer token).
-- This script keeps place_order/cancel_order as "stubs" unless you wire proper L2 headers.
+Endpoints:
+- Gamma markets: https://gamma-api.polymarket.com
+- CLOB orderbook: https://clob.polymarket.com/book
+- Data API trades: https://data-api.polymarket.com/trades
 """
 
 import os
 import json
+import time
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Endpoints
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
 DATA_API_URL = "https://data-api.polymarket.com"
 
-# Optional env vars (only needed for authenticated trading, NOT needed for orderbook/public trades)
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY")
 POLYMARKET_WALLET_ADDRESS = os.getenv("POLYMARKET_WALLET")
 
 
+def _safe_float(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 class PolymarketClient:
-    def __init__(self):
+    def __init__(self, debug: bool = False):
         self.gamma_url = GAMMA_API_URL
         self.clob_url = CLOB_API_URL
         self.data_url = DATA_API_URL
@@ -45,26 +47,39 @@ class PolymarketClient:
         self.api_key = POLYMARKET_API_KEY
         self.wallet = POLYMARKET_WALLET_ADDRESS
 
-        # Gamma is public
+        self.debug = bool(debug)
+
         self.gamma_session = requests.Session()
-
-        # CLOB public endpoints (book/price/etc) are public
         self.clob_public_session = requests.Session()
-
-        # Data API (public for market trades; some endpoints may require additional params)
         self.data_session = requests.Session()
 
-        # Placeholder "private" session (NOT sufficient for real orders without proper L2 headers)
-        self.clob_private_session = requests.Session()
-        if self.api_key:
-            # This Bearer header is NOT the standard L2 header scheme.
-            # Keep it here only if you're experimenting; expect 401 for L2-required endpoints.
-            self.clob_private_session.headers.update(
-                {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                }
-            )
+        # Public endpoints: force "no-cache" behavior (best effort)
+        self.clob_public_session.headers.update(
+            {
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "User-Agent": "polymarket-bot/1.0",
+            }
+        )
+
+        self.gamma_session.headers.update(
+            {
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "User-Agent": "polymarket-bot/1.0",
+            }
+        )
+
+        self.data_session.headers.update(
+            {
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "User-Agent": "polymarket-bot/1.0",
+            }
+        )
 
         print("✅ [04] Polymarket client initialized")
 
@@ -72,10 +87,6 @@ class PolymarketClient:
     # Helpers
     # -----------------------------
     def _parse_jsonish(self, v: Any) -> Any:
-        """
-        Gamma sometimes returns list-like fields as JSON strings, e.g. '["a","b"]'.
-        This makes parsing robust either way.
-        """
         if v is None:
             return None
         if isinstance(v, (list, dict)):
@@ -90,43 +101,45 @@ class PolymarketClient:
         return v
 
     def _get_end_iso(self, market: Dict[str, Any]) -> Optional[str]:
-        # Gamma commonly returns endDateIso or endDate
         return market.get("endDateIso") or market.get("endDate") or market.get("end_date_iso")
 
-    def _calculate_spread(self, best_bid: float, best_ask: float) -> float:
-        """
-        Calculate bid-ask spread as a percentage (returned as decimal)
-        
-        Formula: (Ask - Bid) / Mid Price
-        
-        Args:
-            best_bid: Best bid price
-            best_ask: Best ask price
-        
-        Returns:
-            float: Spread as decimal (e.g., 0.10 = 10% spread)
-        """
-        # Handle None values
+    def _calculate_spread_rel(self, best_bid: Optional[float], best_ask: Optional[float]) -> float:
         if best_bid is None or best_ask is None:
-            return 999.0  # Very high spread to filter out
-        
-        # Handle zero values
+            return 999.0
         if best_bid == 0 and best_ask == 0:
             return 999.0
-        
-        # Calculate mid price
-        mid_price = (best_bid + best_ask) / 2.0
-        
-        # Avoid division by zero
-        if mid_price == 0:
+        mid = (best_bid + best_ask) / 2.0
+        if mid <= 0:
             return 999.0
-        
-        # Calculate spread as decimal
-        # Example: bid=$0.45, ask=$0.55, mid=$0.50
-        # spread = (0.55 - 0.45) / 0.50 = 0.20 (which is 20%)
-        spread = (best_ask - best_bid) / mid_price
-        
-        return spread
+        return (best_ask - best_bid) / mid
+
+    def _sort_book_levels(
+        self, bids: List[Dict[str, Any]], asks: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Defensive sorting:
+        - bids: highest price first
+        - asks: lowest price first
+        """
+        def bid_key(lvl):
+            return _safe_float(lvl.get("price")) if lvl else None
+
+        def ask_key(lvl):
+            return _safe_float(lvl.get("price")) if lvl else None
+
+        bids_sorted = sorted(
+            [b for b in (bids or []) if _safe_float(b.get("price")) is not None],
+            key=lambda x: bid_key(x),
+            reverse=True,
+        )
+
+        asks_sorted = sorted(
+            [a for a in (asks or []) if _safe_float(a.get("price")) is not None],
+            key=lambda x: ask_key(x),
+            reverse=False,
+        )
+
+        return bids_sorted, asks_sorted
 
     # -----------------------------
     # Gamma: Markets
@@ -144,9 +157,6 @@ class PolymarketClient:
         ascending: bool = True,
         slug: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch markets from Gamma API with filters.
-        """
         endpoint = f"{self.gamma_url}/markets"
         params: Dict[str, Any] = {
             "limit": min(int(limit), 100),
@@ -168,7 +178,6 @@ class PolymarketClient:
             params["end_date_max"] = end_date_max
 
         if slug:
-            # API accepts slug array; requests will serialize list properly
             params["slug"] = [slug]
 
         try:
@@ -180,21 +189,12 @@ class PolymarketClient:
             print(f"❌ [04] Error fetching markets: {e}")
             return []
 
-    def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        markets = self.get_markets(limit=1, offset=0, active=None, closed=None, archived=None, slug=slug)
-        return markets[0] if markets else None
-
     def get_active_btc_eth_15m_updown_markets(
         self,
         window_minutes: int = 180,
         include_eth: bool = True,
         print_markets: bool = True,
     ) -> List[Dict[str, Any]]:
-        """
-        Finds active BTC/ETH 15-minute "Up or Down" markets by:
-        - limiting Gamma query to markets ending soon (end_date_min/end_date_max)
-        - filtering question/slug text locally
-        """
         print("🔍 [04] Searching for BTC/ETH 15-min Up/Down markets (windowed)...\n")
 
         now = datetime.now(timezone.utc)
@@ -217,19 +217,14 @@ class PolymarketClient:
             t = (q or "").lower()
             u = (s or "").lower()
             return (
-                "15 minute" in t
-                or "15-minute" in t
-                or "15 min" in t
-                or "15m" in t
-                or "15m" in u
-                or "15min" in u
-                or "15-min" in u
+                "15 minute" in t or "15-minute" in t or "15 min" in t or "15m" in t
+                or "15m" in u or "15min" in u or "15-min" in u
             )
 
         def is_updown(q: str, s: str) -> bool:
             t = (q or "").lower()
             u = (s or "").lower()
-            return ("up or down" in t) or ("updown" in u) or ("up-or-down" in u) or ("up or down" in u)
+            return ("up or down" in t) or ("updown" in u) or ("up-or-down" in u)
 
         def is_btc(q: str, s: str) -> bool:
             t = (q or "").lower()
@@ -273,8 +268,7 @@ class PolymarketClient:
                 self.print_market(m, now)
 
         if print_markets and not results:
-            print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.")
-            print("💡 Try increasing window_minutes, or loosen the 15m filter if the series is labeled differently.\n")
+            print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.\n")
 
         return results
 
@@ -311,37 +305,144 @@ class PolymarketClient:
         print()
 
     # -----------------------------
-    # CLOB (public): Orderbook
+    # Market token/outcome extraction
     # -----------------------------
-    def get_orderbook(self, token_id: str) -> Optional[Dict[str, Any]]:
-        endpoint = f"{self.clob_url}/book"
-        params = {"token_id": token_id}
+    def get_token_ids_from_market(self, market: Dict[str, Any]) -> List[str]:
+        clob_ids = self._parse_jsonish(market.get("clobTokenIds"))
+        if isinstance(clob_ids, list):
+            return [str(x) for x in clob_ids if x]
+        return []
 
+    def get_outcomes_from_market(self, market: Dict[str, Any]) -> List[str]:
+        outcomes = self._parse_jsonish(market.get("outcomes"))
+        if isinstance(outcomes, list):
+            return [str(x) for x in outcomes if x is not None]
+        return []
+
+    # -----------------------------
+    # CLOB (public): Orderbook  ✅ FIXED
+    # -----------------------------
+    def get_orderbook(self, token_id: str, top_n_depth: int = 5) -> Optional[Dict[str, Any]]:
+        """
+        Fetches orderbook and returns a normalized structure:
+        - bids/asks sorted defensively
+        - best_bid/best_ask computed from sorted arrays
+        - mid/spread_abs/spread_rel computed safely
+        - includes response headers for debugging (cache clues)
+        """
+        endpoint = f"{self.clob_url}/book"
+
+        # cache buster prevents some CDNs from serving stale book responses
+        cache_buster = str(int(time.time() * 1000))
+        params = {"token_id": token_id, "_cb": cache_buster}
+
+        t0 = time.time()
         try:
             resp = self.clob_public_session.get(endpoint, params=params, timeout=15)
             resp.raise_for_status()
-            book = resp.json()
+            raw = resp.json()
+            elapsed_ms = (time.time() - t0) * 1000.0
 
-            bids = book.get("bids", []) or []
-            asks = book.get("asks", []) or []
+            bids = raw.get("bids") or []
+            asks = raw.get("asks") or []
 
-            best_bid = float(bids[0]["price"]) if bids else None
-            best_ask = float(asks[0]["price"]) if asks else None
+            bids_sorted, asks_sorted = self._sort_book_levels(bids, asks)
 
-            return {
+            best_bid = _safe_float(bids_sorted[0].get("price")) if bids_sorted else None
+            best_ask = _safe_float(asks_sorted[0].get("price")) if asks_sorted else None
+
+            crossed = (best_bid is not None and best_ask is not None and best_bid > best_ask)
+
+            mid = None
+            spread_abs = None
+            spread_rel = None
+            if best_bid is not None and best_ask is not None and not crossed:
+                mid = (best_bid + best_ask) / 2.0
+                spread_abs = max(0.0, best_ask - best_bid)
+                spread_rel = self._calculate_spread_rel(best_bid, best_ask)
+
+            # Depth: top N sizes (not USD)
+            bid_depth = sum(_safe_float(b.get("size")) or 0.0 for b in (bids_sorted[:top_n_depth] if bids_sorted else []))
+            ask_depth = sum(_safe_float(a.get("size")) or 0.0 for a in (asks_sorted[:top_n_depth] if asks_sorted else []))
+
+            # capture cache-related headers if present
+            hdr = {k: v for k, v in resp.headers.items()}
+            cache_headers = {
+                "Age": hdr.get("Age"),
+                "ETag": hdr.get("ETag"),
+                "CF-Cache-Status": hdr.get("CF-Cache-Status") or hdr.get("Cf-Cache-Status"),
+                "X-Cache": hdr.get("X-Cache"),
+                "Via": hdr.get("Via"),
+            }
+
+            out = {
                 "timestamp": datetime.now(timezone.utc),
                 "token_id": token_id,
-                "bids": bids,
-                "asks": asks,
+                "bids": bids_sorted,
+                "asks": asks_sorted,
                 "best_bid": best_bid,
                 "best_ask": best_ask,
-                "spread": self._calculate_spread(best_bid, best_ask),
-                "bid_depth": sum(float(b.get("size", 0)) for b in bids[:5]),
-                "ask_depth": sum(float(a.get("size", 0)) for a in asks[:5]),
+                "mid": mid,
+                "spread_abs": spread_abs,
+                "spread_rel": spread_rel,
+                "crossed": crossed,
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
+                "http_ms": elapsed_ms,
+                "cache_headers": cache_headers,
             }
+
+            if self.debug:
+                print(
+                    f"      [DEBUG][04] /book token={str(token_id)[:18]}.. "
+                    f"bid={best_bid} ask={best_ask} mid={mid} spread={spread_abs} crossed={crossed} "
+                    f"ms={elapsed_ms:.0f} cache={cache_headers}"
+                )
+
+            return out
+
         except Exception as e:
             print(f"❌ [04] Orderbook error: {e}")
             return None
+
+    def debug_orderbook(self, token_id: str) -> None:
+        """
+        Prints top 3 levels from the raw/sorted book and cache headers
+        """
+        book = self.get_orderbook(token_id, top_n_depth=5)
+        if not book:
+            print("⚠️ No book returned.")
+            return
+
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+
+        def fmt_levels(levels):
+            out = []
+            for lvl in levels[:3]:
+                out.append(f"{_safe_float(lvl.get('price')):.4f}@{_safe_float(lvl.get('size')) or 0:.2f}")
+            return out
+
+        print(f"🔎 token_id={token_id}")
+        print(f"   best_bid={book.get('best_bid')} best_ask={book.get('best_ask')} mid={book.get('mid')} spread_abs={book.get('spread_abs')}")
+        print(f"   bids_top3={fmt_levels(bids) if bids else []}")
+        print(f"   asks_top3={fmt_levels(asks) if asks else []}")
+        print(f"   cache_headers={book.get('cache_headers')}")
+        print(f"   http_ms={book.get('http_ms'):.0f}ms\n")
+
+    def check_complementarity(self, up_book: Dict[str, Any], down_book: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        For binary complements, we expect:
+          up_mid + down_mid ≈ 1
+        """
+        up_mid = up_book.get("mid")
+        dn_mid = down_book.get("mid")
+        if up_mid is None or dn_mid is None:
+            return {"ok": False, "note": "missing mid(s)", "up_mid": up_mid, "down_mid": dn_mid}
+
+        s = up_mid + dn_mid
+        ok = abs(s - 1.0) <= 0.05  # loose tolerance (books can be wide)
+        return {"ok": ok, "sum": s, "up_mid": up_mid, "down_mid": dn_mid}
 
     # -----------------------------
     # Data API (public): Trades
@@ -352,16 +453,9 @@ class PolymarketClient:
         condition_id: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        """
-        Public trade history via Data API.
-        You can filter by:
-          - asset (token_id)
-          - conditionId (market/condition id)
-        """
         endpoint = f"{self.data_url}/trades"
         params: Dict[str, Any] = {"limit": int(limit)}
 
-        # You can pass both; Data API will filter accordingly if supported.
         if condition_id:
             params["conditionId"] = condition_id
         if token_id:
@@ -373,249 +467,86 @@ class PolymarketClient:
             data = resp.json()
 
             out: List[Dict[str, Any]] = []
-            for t in data:
-                out.append(
-                    {
-                        "timestamp": t.get("timestamp"),
-                        "price": float(t["price"]) if t.get("price") is not None else None,
-                        "size": float(t["size"]) if t.get("size") is not None else None,
-                        "side": t.get("side"),
-                        "outcome": t.get("outcome"),
-                        "conditionId": t.get("conditionId"),
-                        "asset": t.get("asset"),
-                        "title": t.get("title"),
-                        "slug": t.get("slug"),
-                    }
-                )
+            if isinstance(data, list):
+                for t in data:
+                    out.append(
+                        {
+                            "timestamp": t.get("timestamp"),
+                            "price": _safe_float(t.get("price")),
+                            "size": _safe_float(t.get("size")),
+                            "side": t.get("side"),
+                            "outcome": t.get("outcome"),
+                            "conditionId": t.get("conditionId"),
+                            "asset": t.get("asset"),
+                            "title": t.get("title"),
+                            "slug": t.get("slug"),
+                        }
+                    )
             return out
         except Exception as e:
             print(f"❌ [04] Public trades error (Data API): {e}")
             return []
 
     # -----------------------------
-    # Helper Methods for Trading Strategy
+    # Strategy helpers
     # -----------------------------
     def get_current_price(self, token_id: str) -> Optional[float]:
-        """
-        Get current mid-price for a token (average of best bid/ask)
-        Used by strategy to determine entry/exit prices
-        """
         book = self.get_orderbook(token_id)
         if not book:
             return None
-        
-        best_bid = book.get('best_bid')
-        best_ask = book.get('best_ask')
-        
-        if best_bid is not None and best_ask is not None:
-            return (best_bid + best_ask) / 2
-        elif best_bid is not None:
-            return best_bid
-        elif best_ask is not None:
-            return best_ask
-        
+        mid = book.get("mid")
+        if mid is not None:
+            return mid
+        # fallback
+        if book.get("best_bid") is not None:
+            return book["best_bid"]
+        if book.get("best_ask") is not None:
+            return book["best_ask"]
         return None
 
     def get_recent_trade_prices(self, token_id: str, limit: int = 30) -> List[float]:
-        """
-        Get recent trade prices for calculating indicators (RSI, etc.)
-        Returns: list of prices (oldest first, newest last)
-        """
         trades = self.get_trades_public(token_id=token_id, limit=limit)
-        
         if not trades:
             return []
-        
-        # Extract prices, filter out None values
-        prices = [t['price'] for t in trades if t.get('price') is not None]
-        
-        # Reverse so oldest is first (for indicator calculations)
+        prices = [t["price"] for t in trades if t.get("price") is not None]
+        # IMPORTANT: Data API often returns newest-first; reverse to oldest-first for indicators
         return list(reversed(prices))
-
-    def get_market_volume(self, token_id: str, limit: int = 50) -> float:
-        """
-        Calculate recent trading volume
-        Returns: total volume in last N trades
-        """
-        trades = self.get_trades_public(token_id=token_id, limit=limit)
-        
-        if not trades:
-            return 0.0
-        
-        total_volume = sum(t.get('size', 0) for t in trades if t.get('size') is not None)
-        return total_volume
-
-    def is_market_active(self, market: Dict[str, Any]) -> bool:
-        """
-        Check if a market is still active (not expired)
-        """
-        now = datetime.now(timezone.utc)
-        end_iso = self._get_end_iso(market)
-        
-        if not end_iso:
-            return True  # Assume active if no end date
-        
-        try:
-            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
-            return end_dt > now
-        except:
-            return True
-
-    def get_time_until_expiry(self, market: Dict[str, Any]) -> Optional[float]:
-        """
-        Get minutes until market expires
-        Returns: minutes (float) or None if can't determine
-        """
-        now = datetime.now(timezone.utc)
-        end_iso = self._get_end_iso(market)
-        
-        if not end_iso:
-            return None
-        
-        try:
-            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
-            seconds_left = (end_dt - now).total_seconds()
-            return seconds_left / 60
-        except:
-            return None
-
-    def get_token_ids_from_market(self, market: Dict[str, Any]) -> List[str]:
-        """
-        Extract token IDs from a market
-        Returns: list of token IDs (usually [YES_token, NO_token])
-        """
-        clob_ids = self._parse_jsonish(market.get('clobTokenIds'))
-        
-        if isinstance(clob_ids, list):
-            return clob_ids
-        
-        return []
-
-    def get_outcomes_from_market(self, market: Dict[str, Any]) -> List[str]:
-        """
-        Extract outcome labels from a market
-        Returns: list of outcome names (usually ['YES', 'NO'])
-        """
-        outcomes = self._parse_jsonish(market.get('outcomes'))
-        
-        if isinstance(outcomes, list):
-            return outcomes
-        
-        return []
-
-    # -----------------------------
-    # CLOB (private): Orders (STUBS)
-    # -----------------------------
-    def place_order_stub(self, token_id: str, side: str, price: float, size: float) -> Optional[Dict[str, Any]]:
-        """
-        IMPORTANT:
-        Real order placement requires proper CLOB L1/L2 auth headers (not Bearer).
-        Leaving this as a stub so you don't keep hitting 401s unexpectedly.
-        """
-        print("⚠️  place_order_stub: Not implemented (requires proper CLOB L2 auth headers).")
-        return None
-
-    def cancel_order_stub(self, order_id: str) -> bool:
-        print("⚠️  cancel_order_stub: Not implemented (requires proper CLOB L2 auth headers).")
-        return False
 
 
 print("✅ [04] Polymarket client loaded")
 
 
-# -----------------------------
-# Test Runner
-# -----------------------------
 if __name__ == "__main__":
-    print("\n🧪 Testing [04] - Gamma + CLOB (book) + Data API (trades)\n" + "=" * 90)
+    print("\n🧪 Testing [04] - Orderbook freshness + sorting\n" + "=" * 90)
 
-    client = PolymarketClient()
+    client = PolymarketClient(debug=True)
 
-    markets = client.get_active_btc_eth_15m_updown_markets(window_minutes=180, include_eth=True, print_markets=True)
-
-    print("=" * 90)
-    print(f"✅ RESULT: Found {len(markets)} active BTC/ETH 15-min Up/Down markets")
-    print("=" * 90)
-
+    markets = client.get_active_btc_eth_15m_updown_markets(window_minutes=45, include_eth=True, print_markets=False)
     if not markets:
-        print("\n⏰ No matching markets right now.")
-        print("   Try widening window_minutes or loosening the 15m detection.\n")
-        print("✅ [04] Tests complete (no markets to test with)\n")
+        print("⚠️ No markets found.")
         raise SystemExit(0)
 
-    # Pick first market
     m = markets[0]
-    condition_id = m.get("conditionId") or m.get("condition_id")
-    
     token_ids = client.get_token_ids_from_market(m)
     outcomes = client.get_outcomes_from_market(m)
 
-    if not token_ids:
-        print("⚠️ No token IDs on this market. Raw keys:")
-        print(m.keys())
-        raise SystemExit(0)
+    print(f"Market: {m.get('slug')}")
+    for i, tid in enumerate(token_ids[:2]):
+        label = outcomes[i] if i < len(outcomes) else f"Outcome{i}"
+        print(f" - {label}: {tid}")
 
-    # Pick first token (usually YES or UP)
-    token_id = token_ids[0]
-    label = outcomes[0] if outcomes else "Outcome 0"
+    if len(token_ids) >= 2:
+        print("\n--- Debug orderbooks (top 3 levels) ---")
+        client.debug_orderbook(token_ids[0])
+        time.sleep(1)
+        client.debug_orderbook(token_ids[0])
+        time.sleep(1)
+        client.debug_orderbook(token_ids[0])
 
-    print(f"\n🎯 Selected market: {m.get('slug')}")
-    print(f"   Token: {label}")
-    print(f"   Token ID: {token_id}")
-    print(f"   Condition ID: {condition_id}\n")
+        b1 = client.get_orderbook(token_ids[0])
+        b2 = client.get_orderbook(token_ids[1])
+        if b1 and b2:
+            comp = client.check_complementarity(b1, b2)
+            print(f"Complementarity check: {comp}")
 
-    # Test new helper methods
-    print("="*90)
-    print("Testing Helper Methods")
-    print("="*90)
-    
-    # Current price
-    current_price = client.get_current_price(token_id)
-    if current_price:
-        print(f"✅ Current Price: ${current_price:.4f}")
-    
-    # Recent trade prices
-    recent_prices = client.get_recent_trade_prices(token_id, limit=10)
-    if recent_prices:
-        print(f"✅ Recent Prices (last 10): {[f'{p:.4f}' for p in recent_prices[-5:]]}")
-    
-    # Volume
-    volume = client.get_market_volume(token_id, limit=50)
-    print(f"✅ Recent Volume: {volume:.2f}")
-    
-    # Market active
-    is_active = client.is_market_active(m)
-    print(f"✅ Market Active: {is_active}")
-    
-    # Time until expiry
-    time_left = client.get_time_until_expiry(m)
-    if time_left:
-        print(f"✅ Time Until Expiry: {time_left:.1f} minutes")
-    
-    print()
-
-    # Orderbook
-    book = client.get_orderbook(token_id)
-    if book and book["best_bid"] is not None and book["best_ask"] is not None:
-        print("✅ Orderbook:")
-        print(f"   Best Bid: ${book['best_bid']:.4f}")
-        print(f"   Best Ask: ${book['best_ask']:.4f}")
-        print(f"   Spread: {book['spread']*100:.2f}%")
-        print(f"   Bid Depth (top 5): ${book['bid_depth']:.2f}")
-        print(f"   Ask Depth (top 5): ${book['ask_depth']:.2f}")
-    else:
-        print("⚠️  Orderbook unavailable or empty.")
-
-    # Public trades (Data API)
-    trades = client.get_trades_public(token_id=token_id, condition_id=condition_id, limit=10)
-    if trades:
-        print("\n✅ Recent public trades (Data API, up to 10):")
-        for i, t in enumerate(trades[:10]):
-            print(
-                f"  {i+1}. ts={t.get('timestamp')} | side={t.get('side')} | size={t.get('size')} | "
-                f"price={t.get('price')} | outcome={t.get('outcome')}"
-            )
-    else:
-        print("\n⚠️  No trades returned from Data API for this filter.")
-
-    print("\n✅ [04] Tests complete\n")
+    print("\n✅ Test complete\n")
