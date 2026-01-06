@@ -237,12 +237,10 @@ class PolymarketClient:
             return ("ethereum" in t) or u.startswith("eth") or (" eth" in t)
 
         results: List[Dict[str, Any]] = []
+        relaxed_results: List[Dict[str, Any]] = []
         for m in candidates:
             q = m.get("question", "")
             s = m.get("slug", "")
-
-            if not is_updown(q, s):
-                continue
 
             if is_btc(q, s):
                 pass
@@ -252,6 +250,10 @@ class PolymarketClient:
                 continue
 
             if not looks_15m(q, s):
+                continue
+
+            if not is_updown(q, s):
+                relaxed_results.append(m)
                 continue
 
             end_iso = self._get_end_iso(m)
@@ -268,7 +270,14 @@ class PolymarketClient:
                 self.print_market(m, now)
 
         if print_markets and not results:
-            print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.\n")
+            if relaxed_results:
+                print("⚠️  No strict Up/Down markets found; using relaxed 15m BTC/ETH set.\n")
+                results = relaxed_results
+                for m in results:
+                    if print_markets:
+                        self.print_market(m, now)
+            else:
+                print("⚠️  No active BTC/ETH 15-min Up/Down markets found in this window.\n")
 
         return results
 
