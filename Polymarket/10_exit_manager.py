@@ -16,11 +16,11 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone, timedelta
 
 # Exit thresholds
-STOP_LOSS_PCT = 0.02             # 2% stop loss
-TAKE_PROFIT_PCT = 0.05           # 5% take profit
-MEAN_REVERSION_THRESHOLD = 0.02  # Within 2% of fair value (0.50)
-MAX_HOLD_TIME_SECONDS = 720      # 12 minutes max hold
-REGIME_BREAK_ATR = 0.020         # 2% ATR triggers exit
+STOP_LOSS_PCT = 0.06             # 2% stop loss
+TAKE_PROFIT_PCT = 0.04          # 5% take profit
+MEAN_REVERSION_THRESHOLD = 0.04  # Within 2% of fair value (0.50)
+MAX_HOLD_TIME_SECONDS = 480      # 12 minutes max hold
+REGIME_BREAK_ATR = 0.035         # 2% ATR triggers exit
 
 
 class ExitManager:

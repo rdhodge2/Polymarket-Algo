@@ -18,7 +18,7 @@ from datetime import datetime, timezone, date
 # Risk limits
 DAILY_LOSS_LIMIT_PCT = 0.05      # 5% max daily loss
 MAX_CONCURRENT_POSITIONS = 3     # Max 3 positions at once
-MAX_CONSECUTIVE_LOSSES = 5       # Stop after 5 losses in a row
+MAX_CONSECUTIVE_LOSSES = 3       # Stop after 5 losses in a row
 MIN_WIN_RATE_THRESHOLD = 0.40    # Pause if win rate drops below 40%
 MIN_TRADES_FOR_WIN_RATE = 20     # Need 20 trades before checking win rate
 
